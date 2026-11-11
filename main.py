@@ -1,4 +1,5 @@
 import os
+from time import time
 from database import SessionLocal, engine, Base
 Base.metadata.create_all(bind=engine)
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -16,6 +17,7 @@ import redis.asyncio as redis
 from google import genai
 import httpx
 from google.genai import types
+from datetime import time
 
 
 sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
@@ -221,25 +223,27 @@ async def select_vehicle(d: dict):
 
 @app.post("/calculate_fare/")
 async def calculate_fare(d: dict):
+    now = time.now().time()
+    if now >= time(21, 30) or now <= time(5, 30):
+        surge = 1.35
+    
+    else:
+        surge = 1.0
+
+
     dist = float(d.get("distance", 1.0))
     v_type = d.get("vehicle_type", "BIKE").upper()
     surge = float(d.get("surge_factor", 1.0))
-    base_rates = {"AUTO": 10.0, "CAR": 10.0, "SEDAN": 10.0, "SUV": 10.0, "BIKE": 10.0}
+    base_rates = {"AUTO": 20.0, "CAR": 30.0, "SEDAN": 35.0, "SUV": 40.0, "HIGH_END_BIKE": 18.0, "STANDARD_BIKE": 10.0}
+    base += pickup_base
     base = base_rates.get(v_type, 10.0) * max(dist, 1.0)
     fare = calculate_dynamic_fare(base, v_type, surge)
     return {"estimated_fare": round(fare, 2)}
 
 
-def calculate_dynamic_fare(base_fare: float, category: str, surge_factor: float) -> float:
-    category_multipliers = {
-        'BIKE': 1.0,
-        'AUTO': 1.2,
-        'CAR': 1.5,
-        'SEDAN': 1.5,
-        'SUV': 2.0
-    }
-    multiplier = category_multipliers.get(category.upper(), 1.0)
-    return base_fare * multiplier * surge_factor
+    pickup_dist = float(d.get("pickup_distance", 1.0))
+    pickup_base = base_rates.get(v_type, 10.0) * pickup_dist
+
 
 
 @app.post("/reject_ride/")
