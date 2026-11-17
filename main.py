@@ -1,55 +1,79 @@
+# ==========================================
+# 1. IMPORTS & INITIALIZATION
+# ==========================================
 import os
-from time import time
-from database import SessionLocal, engine, Base
-Base.metadata.create_all(bind=engine)
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from pydantic import BaseModel
-from fastapi.middleware.cors import CORSMiddleware
-import requests
-from requests_oauthlib import OAuth2Session
-from models import Ride
 import math
 import uuid
-import socketio
-import uvicorn
+import random
 import asyncio
-import redis.asyncio as redis
-from google import genai
+from datetime import datetime, time
+
 import httpx
+import uvicorn
+import socketio
+import redis.asyncio as redis
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from requests_oauthlib import OAuth2Session
+from sqlalchemy.orm import Session
+from google import genai
 from google.genai import types
-from datetime import time
 
+from database import SessionLocal, engine, Base
+from models import Ride
 
+# Create Database Tables
+Base.metadata.create_all(bind=engine)
+
+# App & Socket.IO Setup
 sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
 app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-@app.get("/")
-def read_root():
-    return {"message": "Success"}
-
-def analyze_pothole(image_path: str):
-    client = genai.Client()
-    with open(image_path, 'rb') as f:
-        image_bytes = f.read()
-
-    response = client.models.generate_content(
-        model='gemini-2.5-flash',
-        contents=[types.Part.from_bytes(data=image_bytes, mime_type='image/jpeg'), "Analyze this pothole."]
-
-    )
-    return response.text
-
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
 
 app.mount("/socket.io", socketio.ASGIApp(sio))
+
+# Redis & In-Memory State Setup
+redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
 
 drivers = {
     "Driver_Id1": {"lat": 17.730, "lon": 83.200},
     "Driver_Id2": {"lat": 17.740, "lon": 83.210}
 }
 rides = {}
-redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+civic_reports = {}
+
+# Database Dependency
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# ==========================================
+# 2. APP LAUNCH / HEALTH CHECK (Logo Screen)
+# ==========================================
+@app.get("/")
+def read_root():
+    return {"message": "Success"}
+
+
+# ==========================================
+# 3. LOGIN & AUTHENTICATION (OTP & DigiLocker)
+# ==========================================
+def generate_otp(mobile_number):
+    otp = str(random.randint(100000, 999999))
+    print(f"Generated OTP for {mobile_number}: {otp}")
+    return otp
 
 os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
 CLIENT_ID = "YOUR_CLIENT_ID"
@@ -57,6 +81,40 @@ CLIENT_SECRET = "YOUR_CLIENT_SECRET"
 AUTHORIZATION_BASE_URL = "https://api.digitallocker.gov.in/authorize"
 TOKEN_URL = "https://api.digitallocker.gov.in/token"
 REDIRECT_URI = "http://localhost:8000/callback"
+
+class OTPRequest(BaseModel):
+    phone_number: str
+
+class OTPVerifyRequest(BaseModel):
+    phone_number: str
+    otp: str
+
+@app.post("/send_otp/")
+async def send_otp(data: OTPRequest, db: Session = Depends(get_db)):
+    otp = generate_otp(data.phone_number)
+    await redis_client.setex(f"otp:{data.phone_number}", 300, otp)
+    print(f"DEBUG OTP for {data.phone_number}: {otp}")
+    return {
+        "status": "success",
+        "message": "OTP sent successfully",
+        "debug_otp": otp
+    }
+
+@app.post("/verify_otp/")
+async def verify_otp(data: OTPVerifyRequest, db: Session = Depends(get_db)):
+    saved_otp = await redis_client.get(f"otp:{data.phone_number}")
+    if not saved_otp or saved_otp != data.otp:
+        raise HTTPException(status_code=400, detail="Invalid or expired OTP")
+   
+    await redis_client.delete(f"otp:{data.phone_number}")
+    auth_token = f"TOKEN-{uuid.uuid4().hex}"
+    await redis_client.setex(f"token:{auth_token}", 86400, data.phone_number)
+   
+    return {
+        "status": "success",
+        "access_token": auth_token,
+        "phone_number": data.phone_number
+    }
 
 @app.get("/login")
 def login():
@@ -78,21 +136,9 @@ def callback(code: str, state: str):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-
-class RideRequest(BaseModel):
-    user_id: str
-    pickup_location: str
-    destination: str
-    vehicle_type: str
-    user_lat: float
-    user_lon: float
-
-
-class AcceptRideRequest(BaseModel):
-    ride_id: str
-    driver_id: str
-
-
+# ==========================================
+# 4. APP INTERFACE & PRE-RIDE (Fare, Route, Vehicle)
+# ==========================================
 def calculate_haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371.0
     dlat, dlon = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
@@ -102,93 +148,49 @@ def calculate_haversine_distance(lat1: float, lon1: float, lat2: float, lon2: fl
     )
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
+def calculate_dynamic_fare(base: float, v_type: str, surge: float) -> float:
+    return base * surge
 
-async def send_ride_notifications(ride_id: str):
-    while ride_id in rides and rides[ride_id].get("status") in ["pending", "searching"]:
-        await sio.emit("ride_requested", {"ride_id": ride_id})
-        await asyncio.sleep(10)
+@app.post("/calculate_fare/")
+async def calculate_fare(d: dict, db: Session = Depends(get_db)):
+    now = datetime.now().time()
+    night_surge = 1.35 if (now >= time(21, 30) or now <= time(5, 30)) else 1.0
 
+    dist = float(d.get("distance", 1.0))
+    pickup_dist = float(d.get("pickup_distance", 1.0))
+    v_type = d.get("vehicle_type", "STANDARD_BIKE").upper()
+    surge = float(d.get("surge_factor", night_surge))
+   
+    base_rates = {
+        "AUTO": 20.0, "CAR": 30.0, "SEDAN": 35.0,
+        "SUV": 40.0, "HIGH_END_BIKE": 18.0, "STANDARD_BIKE": 10.0
+    }
+    rate = base_rates.get(v_type, 10.0)
+   
+    pickup_base = rate * pickup_dist
+    base = (rate * max(dist, 1.0)) + pickup_base
+    fare = calculate_dynamic_fare(base, v_type, surge)
+    return {"estimated_fare": round(fare, 2)}
 
-@app.post("/create_ride_request/")
-async def create_ride_request(ride: RideRequest, background_tasks: BackgroundTasks):
-    available_drivers = [
-        d_id for d_id, d in drivers.items()
-        if calculate_haversine_distance(ride.user_lat, ride.user_lon, d['lat'], d['lon']) <= 3.0
-    ]
-    
-    if not available_drivers:
-        available_drivers = [
-            d_id for d_id, d in drivers.items()
-            if calculate_haversine_distance(ride.user_lat, ride.user_lon, d['lat'], d['lon']) <= 5.0
-        ]
-        ride_id = str(uuid.uuid4())
-        ride_data = ride.model_dump() if hasattr(ride, "model_dump") else ride.dict()
-        rides[ride_id] = {**ride_data, "status": "pending", "matched_drivers": available_drivers}
-        background_tasks.add_task(send_ride_notifications, ride_id)
-        return {"ride_id": ride_id, "status": "Created", "matched_drivers": available_drivers}
-
-
-
-@app.post("/accept_ride/")
-async def accept_ride_endpoint(data: AcceptRideRequest):
-    if data.ride_id not in rides:
+@app.post("/select_vehicle/")
+async def select_vehicle(d: dict, db: Session = Depends(get_db)):
+    r = rides.get(d.get("ride_id"))
+    if not r:
         raise HTTPException(status_code=404, detail="Not found")
-    if data.driver_id not in rides[data.ride_id]["matched_drivers"]:
-        raise HTTPException(status_code=403, detail="Driver not matched")
-    
-    lock_key = f"lock:ride:{data.ride_id}"
-    try:
-        if not await redis_client.set(lock_key, data.driver_id, nx=True, ex=10):
-            raise HTTPException(status_code=409, detail="Processing by another")
-        if rides[data.ride_id].get("status") == "accepted":
-            raise HTTPException(status_code=409, detail="Already accepted")
-        
-        rides[data.ride_id].update({"status": "accepted", "accepted_by": data.driver_id})
-        return {"status": "success", "message": f"Accepted by {data.driver_id}"}
-    finally:
-        if await redis_client.get(lock_key) == data.driver_id:
-            await redis_client.delete(lock_key)
+    r["vehicle_type"] = d.get("vehicle_type")
+    return {"status": "success"}
 
-
-@app.post("/cancel_ride/")
-async def cancel_ride(data: dict):
+@app.post("/select_route/")
+async def select_route(data: dict, db: Session = Depends(get_db)):
     ride_id = data.get("ride_id")
-    r = rides.get(ride_id)
-    if not r or r["status"] in ["completed", "cancelled"]:
-        raise HTTPException(status_code=400, detail="Invalid action")
-    penalty = 50 if r["status"] == "accepted" else 0
-    r["status"] = "cancelled"
-    r["penalty"] = penalty
-    return {"status": "cancelled", "penalty": penalty}
-
-
-@sio.event
-async def update_driver_location(sid, data):
-    ride_id = data.get('ride_id')
-    location = data.get('location')
-    if not ride_id or ride_id not in rides or not location:
-        return
-
-    await sio.emit('rider_route_update', {'ride_id': ride_id, 'location': location})
-    route = rides[ride_id].get("route_coordinates", [])
-    if route and calculate_haversine_distance(location['lat'], location['lon'], route[-1]['lat'], route[-1]['lon']) > 0.5:
-        await sio.emit("route_deviation_alert", {"ride_id": ride_id})
-
-
-@app.post("/complete_ride/")
-async def complete_ride(data: dict):
-    ride_id = data.get("ride_id")
-    if not ride_id or ride_id not in rides:
+    if ride_id not in rides:
         raise HTTPException(status_code=404, detail="Ride not found")
-    
-    fare = rides[ride_id].get("total_fare", 100.0)
-    ledger = calculate_split_ledger(fare)
-    rides[ride_id].update({"status": "completed", "ledger": ledger})
-    return {"status": "completed", "ride_id": ride_id, "ledger": ledger}
-
+    selected_route = data.get("route_name")
+    rides[ride_id]["route"] = selected_route
+    return {"status": "success", "ride_id": ride_id, "route": selected_route}
 
 @app.post("/update_location/")
-async def update_location(data: dict):
+async def update_location(data: dict, db: Session = Depends(get_db)):
     driver_id = data.get("driver_id")
     if not driver_id or "lat" not in data or "lon" not in data:
         raise HTTPException(status_code=400, detail="Missing driver_id, lat, or lon")
@@ -196,58 +198,74 @@ async def update_location(data: dict):
     return {"status": "success"}
 
 
-@app.post("/get_ride_status/")
-async def get_ride_status(d: dict):
-    ride_id = d.get("ride_id")
-    r = rides.get(ride_id)
-    if not r:
+# ==========================================
+# 5. RIDE BOOKING (Create Ride & Notifications)
+# ==========================================
+class RideRequest(BaseModel):
+    user_id: str
+    pickup_location: str
+    destination: str
+    vehicle_type: str
+    user_lat: float
+    user_lon: float
+
+async def send_ride_notifications(ride_id: str):
+    while ride_id in rides and rides[ride_id].get("status") in ["pending", "searching"]:
+        await sio.emit("ride_requested", {"ride_id": ride_id})
+        await asyncio.sleep(10)
+
+@app.post("/create_ride_request/")
+async def create_ride_request(ride: RideRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    available_drivers = [
+        d_id for d_id, d in drivers.items()
+        if calculate_haversine_distance(ride.user_lat, ride.user_lon, d['lat'], d['lon']) <= 3.0
+    ]
+   
+    if not available_drivers:
+        available_drivers = [
+            d_id for d_id, d in drivers.items()
+            if calculate_haversine_distance(ride.user_lat, ride.user_lon, d['lat'], d['lon']) <= 5.0
+        ]
+
+    ride_id = str(uuid.uuid4())
+    ride_data = ride.model_dump() if hasattr(ride, "model_dump") else ride.dict()
+    rides[ride_id] = {**ride_data, "status": "pending", "matched_drivers": available_drivers}
+   
+    if available_drivers:
+        background_tasks.add_task(send_ride_notifications, ride_id)
+       
+    return {"ride_id": ride_id, "status": "Created", "matched_drivers": available_drivers}
+
+
+# ==========================================
+# 6. CONFIRM / ACCEPT / REJECT / CANCEL RIDE
+# ==========================================
+class AcceptRideRequest(BaseModel):
+    ride_id: str
+    driver_id: str
+
+@app.post("/accept_ride/")
+async def accept_ride_endpoint(data: AcceptRideRequest, db: Session = Depends(get_db)):
+    if data.ride_id not in rides:
         raise HTTPException(status_code=404, detail="Not found")
-    return {"ride_id": ride_id, "status": r.get("status")}
-
-
-@app.post("/get_ride_history/")
-async def get_ride_history(d: dict):
-    u = d.get("user_id")
-    h = [r for r in rides.values() if r.get("user_id") == u]
-    return {"ride_history": h}
-
-
-@app.post("/select_vehicle/")
-async def select_vehicle(d: dict):
-    r = rides.get(d.get("ride_id"))
-    if not r:
-        raise HTTPException(status_code=404, detail="Not found")
-    r["vehicle_type"] = d.get("vehicle_type")
-    return {"status": "success"}
-
-
-@app.post("/calculate_fare/")
-async def calculate_fare(d: dict):
-    now = time.now().time()
-    if now >= time(21, 30) or now <= time(5, 30):
-        surge = 1.35
-    
-    else:
-        surge = 1.0
-
-
-    dist = float(d.get("distance", 1.0))
-    v_type = d.get("vehicle_type", "BIKE").upper()
-    surge = float(d.get("surge_factor", 1.0))
-    base_rates = {"AUTO": 20.0, "CAR": 30.0, "SEDAN": 35.0, "SUV": 40.0, "HIGH_END_BIKE": 18.0, "STANDARD_BIKE": 10.0}
-    base += pickup_base
-    base = base_rates.get(v_type, 10.0) * max(dist, 1.0)
-    fare = calculate_dynamic_fare(base, v_type, surge)
-    return {"estimated_fare": round(fare, 2)}
-
-
-    pickup_dist = float(d.get("pickup_distance", 1.0))
-    pickup_base = base_rates.get(v_type, 10.0) * pickup_dist
-
-
+    if data.driver_id not in rides[data.ride_id]["matched_drivers"]:
+        raise HTTPException(status_code=403, detail="Driver not matched")
+   
+    lock_key = f"lock:ride:{data.ride_id}"
+    try:
+        if not await redis_client.set(lock_key, data.driver_id, nx=True, ex=10):
+            raise HTTPException(status_code=409, detail="Processing by another")
+        if rides[data.ride_id].get("status") == "accepted":
+            raise HTTPException(status_code=409, detail="Already accepted")
+       
+        rides[data.ride_id].update({"status": "accepted", "accepted_by": data.driver_id})
+        return {"status": "success", "message": f"Accepted by {data.driver_id}"}
+    finally:
+        if await redis_client.get(lock_key) == data.driver_id:
+            await redis_client.delete(lock_key)
 
 @app.post("/reject_ride/")
-async def reject_ride(data: dict, background_tasks: BackgroundTasks):
+async def reject_ride(data: dict, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     ride_id = data.get("ride_id")
     rejected_driver = data.get("driver_id")
     r = rides.get(ride_id)
@@ -279,68 +297,63 @@ async def reject_ride(data: dict, background_tasks: BackgroundTasks):
     background_tasks.add_task(send_ride_notifications, ride_id)
     return {"status": "searching_driver", "new_matches": available_drivers}
 
-
-@app.post("/rate_ride/")
-async def rate_ride(data: dict):
+@app.post("/cancel_ride/")
+async def cancel_ride(data: dict, db: Session = Depends(get_db)):
     ride_id = data.get("ride_id")
-    if ride_id not in rides:
-        raise HTTPException(status_code=404, detail="Ride not found")
-    rides[ride_id]["rating"] = data.get("rating")
-    rides[ride_id]["review"] = data.get("review", "")
-    return {"status": "success", "message": "Rating recorded"}
+    r = rides.get(ride_id)
+    if not r or r["status"] in ["completed", "cancelled"]:
+        raise HTTPException(status_code=400, detail="Invalid action")
+    penalty = 50 if r["status"] == "accepted" else 0
+    r["status"] = "cancelled"
+    r["penalty"] = penalty
+    return {"status": "cancelled", "penalty": penalty}
+
+@app.post("/get_ride_status/")
+async def get_ride_status(d: dict, db: Session = Depends(get_db)):
+    ride_id = d.get("ride_id")
+    r = rides.get(ride_id)
+    if not r:
+        raise HTTPException(status_code=404, detail="Not found")
+    return {"ride_id": ride_id, "status": r.get("status")}
 
 
-@app.post("/select_route/")
-async def select_route(data: dict):
-    ride_id = data.get("ride_id")
-    if ride_id not in rides:
-        raise HTTPException(status_code=404, detail="Ride not found")
-    selected_route = data.get("route_name")
-    rides[ride_id]["route"] = selected_route
-    return {"status": "success", "ride_id": ride_id, "route": selected_route}
+# ==========================================
+# 7. IN-RIDE TRACKING, CALLS & SOS SAFETY
+# ==========================================
+@sio.event
+async def update_driver_location(sid, data):
+    ride_id = data.get('ride_id')
+    location = data.get('location')
+    if not ride_id or ride_id not in rides or not location:
+        return
 
+    await sio.emit('rider_route_update', {'ride_id': ride_id, 'location': location})
+    route = rides[ride_id].get("route_coordinates", [])
+    if route and calculate_haversine_distance(location['lat'], location['lon'], route[-1]['lat'], route[-1]['lon']) > 0.5:
+        await sio.emit("route_deviation_alert", {"ride_id": ride_id})
 
-@app.post("/api/v1/payments/process")
-async def process_payment(data: dict):
-    ride_id = data.get("ride_id")
-    amount = data.get("amount")
-    if ride_id not in rides:
-        raise HTTPException(status_code=404, detail="Ride not found")
-    return {"status": "success", "ride_id": ride_id, "amount": amount}
+async def initiate_masked_call(driver_phone: str, rider_phone: str):
+    url = 'https://api.masking.service/v1/call'
+    payload = {'driver_phone': driver_phone, 'rider_phone': rider_phone}
+    headers = {'Authorization': 'Bearer YOUR_API_KEY'}
+    async with httpx.AsyncClient() as client:
+        response = await client.post(url, json=payload, headers=headers, timeout=5)
+    return response.json()
 
+@app.post("/masked_call/")
+async def make_masked_call(data: dict, db: Session = Depends(get_db)):
+    driver_phone = data.get("driver_phone")
+    rider_phone = data.get("rider_phone")
+    if not driver_phone or not rider_phone:
+        raise HTTPException(status_code=400, detail="Missing phone numbers")
+    response = await initiate_masked_call(driver_phone, rider_phone)
+    return {"status": "success", "response": response}
 
-async def confirm_ride_closure(ride_id: str, role: str):
-    if ride_id in rides:
-        rides[ride_id][f"{role}_confirmed"] = True
-        if rides[ride_id].get("driver_confirmed") and rides[ride_id].get("rider_confirmed"):
-            rides[ride_id]["status"] = "closed"
-
-
-@app.post("/confirm_closure/")
-async def handle_ride_closure(data: dict):
-    ride_id = data.get("ride_id")
-    role = data.get("role")
-    if not ride_id or role not in ["driver", "rider"]:
-        raise HTTPException(status_code=400, detail="Invalid parameters")
-    await confirm_ride_closure(ride_id, role)
-    return {"status": "success", "message": f"{role} confirmation recorded for ride {ride_id}"}
- 
-
-
-def calculate_split_ledger(total_fare: float) -> dict:
-    return {
-        "platform": round(total_fare * 0.20, 2),
-        "driver": round(total_fare * 0.80, 2)
-    }
-
-
-async def notify_emergency_contacts(ride_id: str):
+async def notify_emergency_contacts(ride_id: str, ):
     await sio.emit("sos_alert", {"ride_id": ride_id, "level": "emergency_contacts"})
-
 
 async def dispatch_108_emergency(ride_id: str):
     await sio.emit("sos_alert", {"ride_id": ride_id, "level": "dispatch_108"})
-
 
 async def trigger_sos_escalation(ride_id: str, stage: int):
     if stage == 1:
@@ -349,7 +362,7 @@ async def trigger_sos_escalation(ride_id: str, stage: int):
         await dispatch_108_emergency(ride_id)
 
 @app.post("/trigger_sos/")
-async def handle_sos_escalation(data: dict):
+async def handle_sos_escalation(data: dict, db: Session = Depends(get_db)):
     ride_id = data.get("ride_id")
     stage = data.get("stage")
     if not ride_id or stage not in [1, 2]:
@@ -358,30 +371,74 @@ async def handle_sos_escalation(data: dict):
     return {"status": "success", "message": f"SOS stage {stage} triggered for ride {ride_id}"}
 
 
+# ==========================================
+# 8. RIDE CLOSURE & COMPLETION
+# ==========================================
+def calculate_split_ledger(total_fare: float) -> dict:
+    return {
+        "platform": round(total_fare * 0.20, 2),
+        "driver": round(total_fare * 0.80, 2)
+    }
+
+@app.post("/complete_ride/")
+async def complete_ride(data: dict, db: Session = Depends(get_db)):
+    ride_id = data.get("ride_id")
+    if not ride_id or ride_id not in rides:
+        raise HTTPException(status_code=404, detail="Ride not found")
+   
+    fare = rides[ride_id].get("total_fare", 100.0)
+    ledger = calculate_split_ledger(fare)
+    rides[ride_id].update({"status": "completed", "ledger": ledger})
+    return {"status": "completed", "ride_id": ride_id, "ledger": ledger}
+
+async def confirm_ride_closure(ride_id: str, role: str, db: Session = Depends(get_db)):
+    if ride_id in rides:
+        rides[ride_id][f"{role}_confirmed"] = True
+        if rides[ride_id].get("driver_confirmed") and rides[ride_id].get("rider_confirmed"):
+            rides[ride_id]["status"] = "closed"
+
+@app.post("/confirm_closure/")
+async def handle_ride_closure(data: dict, db: Session = Depends(get_db)):
+    ride_id = data.get("ride_id")
+    role = data.get("role")
+    if not ride_id or role not in ["driver", "rider"]:
+        raise HTTPException(status_code=400, detail="Invalid parameters")
+    await confirm_ride_closure(ride_id, role)
+    return {"status": "success", "message": f"{role} confirmation recorded for ride {ride_id}"}
 
 
-async def initiate_masked_call(driver_phone: str, rider_phone: str):
-    url = 'https://api.masking.service/v1/call'
-    payload = {'driver_phone': driver_phone, 'rider_phone': rider_phone}
-    headers = {'Authorization': 'Bearer YOUR_API_KEY'}
-    async with httpx.AsyncClient() as client: response = await client.post(url, json=payload, headers=headers, timeout=5) 
-    return response.json()
+# ==========================================
+# 9. PAYMENT INTEGRATION, RATINGS & HISTORY
+# ==========================================
+@app.post("/api/v1/payments/process")
+async def process_payment(data: dict, db: Session = Depends(get_db)):
+    ride_id = data.get("ride_id")
+    amount = data.get("amount")
+    if ride_id not in rides:
+        raise HTTPException(status_code=404, detail="Ride not found")
+    return {"status": "success", "ride_id": ride_id, "amount": amount}
+
+@app.post("/rate_ride/")
+async def rate_ride(data: dict, db: Session = Depends(get_db)):
+    ride_id = data.get("ride_id")
+    if ride_id not in rides:
+        raise HTTPException(status_code=404, detail="Ride not found")
+    rides[ride_id]["rating"] = data.get("rating")
+    rides[ride_id]["review"] = data.get("review", "")
+    return {"status": "success", "message": "Rating recorded"}
+
+@app.post("/get_ride_history/")
+async def get_ride_history(d: dict, db: Session = Depends(get_db)):
+    u = d.get("user_id")
+    h = [r for r in rides.values() if r.get("user_id") == u]
+    return {"ride_history": h}
 
 
-@app.post("/masked_call/")
-async def make_masked_call(data: dict):
-    driver_phone = data.get("driver_phone")
-    rider_phone = data.get("rider_phone")
-    if not driver_phone or not rider_phone:
-        raise HTTPException(status_code=400, detail="Missing phone numbers")
-    response = await initiate_masked_call(driver_phone, rider_phone)
-    return {"status": "success", "response": response}
-
-
-
+# ==========================================
+# 10. REFERRALS & CIVIC REPORTING (Add-ons)
+# ==========================================
 def generate_referral_code(user_id: str) -> str:
     return f'REF{uuid.uuid4().hex[:6].upper()}'
-
 
 @app.post('/apply_referral/')
 async def apply_referral(data: dict):
@@ -389,12 +446,39 @@ async def apply_referral(data: dict):
     referee_id = data.get('referee_id')
     return {'status': 'success', 'message': 'Referral applied', 'referrer_id': referrer_id, 'referee_id': referee_id}
 
-civic_reports = {}
+def analyze_pothole(image_path: str):
+    client = genai.Client()
+    with open(image_path, 'rb') as f:
+        image_bytes = f.read()
 
+    response = client.models.generate_content(
+        model='gemini-2.5-flash',
+        contents=[types.Part.from_bytes(data=image_bytes, mime_type='image/jpeg'), "Analyze this pothole."]
+    )
+    return response.text
+
+@app.post("/analyze_pothole_image/")
+async def analyze_pothole_endpoint(file: UploadFile = File(...)):
+    try:
+        image_bytes = await file.read()
+        client = genai.Client()
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[
+                types.Part.from_bytes(data=image_bytes, mime_type=file.content_type),
+                "Analyze this road image. Is there a pothole or road damage? Rate severity (Low/Medium/High) and describe briefly."
+            ]
+        )
+        return {
+            "status": "success",
+            "ai_analysis": response.text
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI Analysis failed: {str(e)}")
 
 class CivicIssueReport(BaseModel):
     reporter_id: str
-    role: str  # "driver" or "rider"
+    role: str
     issue_type: str = "pothole"
     image_url: str
     lat: float
@@ -404,7 +488,6 @@ class CivicIssueReport(BaseModel):
     mla_handle: str = "@LocalMLA"
     social_handle: str = ""
     description: str = ""
-
 
 @app.post("/report_civic_issue/")
 async def report_civic_issue(report: CivicIssueReport):
@@ -436,7 +519,7 @@ async def report_civic_issue(report: CivicIssueReport):
     return {
         "status": "success",
         "report_id": report_id,
-        "notified_authorities": [report.municipal_body, report.mla_handle,],
+        "notified_authorities": [report.municipal_body, report.mla_handle],
         "social_media_payload": {
             "linked_handle": report.social_handle,
             "image_url": report.image_url,
@@ -445,12 +528,13 @@ async def report_civic_issue(report: CivicIssueReport):
         }
     }
 
-
 @app.get("/get_civic_reports/")
 async def get_civic_reports():
     return {"civic_reports": list(civic_reports.values())}
 
 
-
+# ==========================================
+# 11. SERVER ENTRY POINT
+# ==========================================
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
